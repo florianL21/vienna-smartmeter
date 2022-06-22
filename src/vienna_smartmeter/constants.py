@@ -3,6 +3,7 @@ import re
 MAIN_SCRIPT_REGEX = re.compile("^main\S+\.js$")
 API_GATEWAY_TOKEN_REGEX = re.compile("b2capiKey\:\"([A-Za-z0-9-_]+)\"")
 
+PAGE_URL = "https://smartmeter-web.wienernetze.at/"
 API_URL_ALT = "https://service.wienernetze.at/sm/api/"
 API_URL = "https://api.wstw.at/gateway/WN_SMART_METER_PORTAL_API_B2C/1.0/"
 REDIRECT_URI = "https://smartmeter-web.wienernetze.at/"

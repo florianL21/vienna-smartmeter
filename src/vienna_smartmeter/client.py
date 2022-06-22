@@ -63,17 +63,17 @@ class Smartmeter:
             raise SmartmeterConnectionError(f"Could not obtain access token: {result.content}")
 
         self._access_token = result.json()["access_token"]
-        self._api_gateway_token = self._get_api_key(tree)
+        self._api_gateway_token = self._get_api_key(self._access_token)
 
-    def _get_api_key(self, tree):
+    def _get_api_key(self, token):
         headers = {
-            "Authorization": f"Bearer {self._access_token}"
+            "Authorization": f"Bearer {token}"
         }
-        result = self.session.get("https://smartmeter-web.wienernetze.at/", headers=headers)
+        result = self.session.get(const.PAGE_URL, headers=headers)
         tree = html.fromstring(result.content)
         scripts = tree.xpath("(//script/@src)")
         for script in scripts:
-            response = self.session.get("https://smartmeter-web.wienernetze.at/" + script)
+            response = self.session.get(const.PAGE_URL + script)
             if const.MAIN_SCRIPT_REGEX.match(script):
                 for match in const.API_GATEWAY_TOKEN_REGEX.findall(response.text):
                     return match

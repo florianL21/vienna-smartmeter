@@ -15,7 +15,7 @@ from vienna_smartmeter import constants as const
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT = 10
+TIMEOUT = 20
 
 
 class AsyncSmartmeter:
@@ -35,6 +35,7 @@ class AsyncSmartmeter:
         self._session = session or aiohttp.ClientSession()
         self._timeout = timeout
         self._access_token = None
+        self._api_gateway_token = None
 
     async def _get_login_action(self):
         login_url = const.AUTH_URL + "auth?" + parse.urlencode(const.LOGIN_ARGS)
@@ -59,6 +60,24 @@ class AsyncSmartmeter:
             auth_code = resp.headers["Location"].split("&code=", 1)[1]
             return auth_code
 
+    async def _get_api_key(self, access_token):
+        async with self._session.request(
+            "GET",
+            const.PAGE_URL,
+            data = { "Authorization": f"Bearer {access_token}" }
+        ) as result:
+            tree = html.fromstring(await result.text())
+            scripts = tree.xpath("(//script/@src)")
+            for script in scripts:
+                async with self._session.request(
+                    "GET",
+                    const.PAGE_URL + script
+                ) as response:
+                    if const.MAIN_SCRIPT_REGEX.match(script):
+                        for match in const.API_GATEWAY_TOKEN_REGEX.findall(await response.text()):
+                            return match
+        return None
+
     async def refresh_token(self):
         """Create a valid access token."""
         async with self._session.request(
@@ -71,6 +90,7 @@ class AsyncSmartmeter:
                     "Authentication failed. Check user credentials."
                 )
             self._access_token = json.loads(await response.text())["access_token"]
+            self._api_gateway_token = await self._get_api_key(self._access_token)
 
         logger.debug("Successfully authenticated Smart Meter API")
 
@@ -127,6 +147,20 @@ class AsyncSmartmeter:
         )
         return await self._request(endpoint, query=query)
 
+    async def tages_verbrauch(
+        self,
+        day: datetime,
+        zaehlpunkt=None,
+    ):
+        """Get verbrauch_raw from the API."""
+        if zaehlpunkt is None:
+            zaehlpunkt = await self._get_first_zaehlpunkt()
+        endpoint = f"messdaten/zaehlpunkt/{zaehlpunkt}/verbrauch"
+        query = const.build_verbrauchs_args(
+            dateFrom = self._dt_string(day.replace(hour=0, minute=0, second=0))
+        )
+        return await self._request(endpoint, query=query)
+
     async def profil(self):
         """Get profil of logged in user."""
         return await self._request("user/profile", const.API_URL_ALT)
@@ -158,7 +192,9 @@ class AsyncSmartmeter:
 
         logger.debug(f"REQUEST: {url}")
 
-        headers = {"Authorization": f"Bearer {self._access_token}", "X-Gateway-APIKey": const.GATEWAY_API_KEY}
+        headers = {"Authorization": f"Bearer {self._access_token}" }
+        if self._api_gateway_token is not None:
+            headers.update({"X-Gateway-APIKey": self._api_gateway_token})
 
         try:
             async with async_timeout.timeout(self._timeout):
