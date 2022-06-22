@@ -6,18 +6,14 @@ from urllib import parse
 import requests
 from lxml import html
 
-from .errors import SmartmeterLoginError
+from .errors import SmartmeterLoginError, SmartmeterConnectionError
+from vienna_smartmeter import constants as const
 
 logger = logging.getLogger(__name__)
 
 
 class Smartmeter:
     """Smartmeter client."""
-
-    API_URL_WSTW = "https://api.wstw.at/gateway/WN_SMART_METER_PORTAL_API_B2C/1.0/"
-    API_URL_WN = "https://service.wienernetze.at/rest/smp/1.0/"
-    API_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
-    AUTH_URL = "https://log.wien/auth/realms/logwien/protocol/openid-connect/"  # noqa
 
     def __init__(self, username, password, login=True):
         """Access the Smartmeter API.
@@ -31,22 +27,16 @@ class Smartmeter:
         self.password = password
         self.session = requests.Session()
         self._access_token = None
+        self._api_gateway_token = None
 
         if login:
             self._login()
 
     def _login(self):
-        args = {
-            "client_id": "wn-smartmeter",
-            "redirect_uri": "https://www.wienernetze.at/wnapp/smapp/",
-            "response_mode": "fragment",
-            "response_type": "code",
-            "scope": "openid",
-            "nonce": "",
-            "prompt": "login",
-        }
-        login_url = self.AUTH_URL + "auth?" + parse.urlencode(args)
+        login_url = const.AUTH_URL + "auth?" + parse.urlencode(const.LOGIN_ARGS)
         result = self.session.get(login_url)
+        if result.status_code != 200:
+            raise SmartmeterConnectionError(f"Could not load login page. Error: {result.content}")
         tree = html.fromstring(result.content)
         action = tree.xpath("(//form/@action)")[0]
 
@@ -65,21 +55,34 @@ class Smartmeter:
         code = result.headers["Location"].split("&code=", 1)[1]
 
         result = self.session.post(
-            self.AUTH_URL + "token",
-            data={
-                "code": code,
-                "grant_type": "authorization_code",
-                "client_id": "wn-smartmeter",
-                "redirect_uri": "https://www.wienernetze.at/wnapp/smapp/",
-            },
+            const.AUTH_URL + "token",
+            data = const.build_access_token_args(code=code),
         )
 
+        if result.status_code != 200:
+            raise SmartmeterConnectionError(f"Could not obtain access token: {result.content}")
+
         self._access_token = result.json()["access_token"]
+        self._api_gateway_token = self._get_api_key(tree)
+
+    def _get_api_key(self, tree):
+        headers = {
+            "Authorization": f"Bearer {self._access_token}"
+        }
+        result = self.session.get("https://smartmeter-web.wienernetze.at/", headers=headers)
+        tree = html.fromstring(result.content)
+        scripts = tree.xpath("(//script/@src)")
+        for script in scripts:
+            response = self.session.get("https://smartmeter-web.wienernetze.at/" + script)
+            if const.MAIN_SCRIPT_REGEX.match(script):
+                for match in const.API_GATEWAY_TOKEN_REGEX.findall(response.text):
+                    return match
+        return None
 
     def _dt_string(self, datetime_string):
-        return datetime_string.strftime(self.API_DATE_FORMAT)[:-3] + "Z"
+        return datetime_string.strftime(const.API_DATE_FORMAT)[:-3] + "Z"
 
-    def _call_api_wstw(
+    def _call_api(
         self,
         endpoint,
         base_url=None,
@@ -89,7 +92,7 @@ class Smartmeter:
         return_response=False,
     ):
         if base_url is None:
-            base_url = self.API_URL_WSTW
+            base_url = const.API_URL
         url = "{0}{1}".format(base_url, endpoint)
 
         if query:
@@ -99,40 +102,7 @@ class Smartmeter:
 
         headers = {
             "Authorization": f"Bearer {self._access_token}",
-            "X-Gateway-APIKey": "afb0be74-6455-44f5-a34d-6994223020ba",
-        }
-
-        if data:
-            logger.debug("DATA: {}", data)
-            headers["Content-Type"] = "application/json"
-
-        response = self.session.request(method, url, headers=headers, json=data)
-
-        if return_response:
-            return response
-
-        return response.json()
-
-    def _call_api_wn(
-        self,
-        endpoint,
-        base_url=None,
-        method="GET",
-        data=None,
-        query=None,
-        return_response=False,
-    ):
-        if base_url is None:
-            base_url = self.API_URL_WN
-        url = "{0}{1}".format(base_url, endpoint)
-
-        if query:
-            url += ("?" if "?" not in endpoint else "&") + parse.urlencode(query)
-
-        logger.debug("REQUEST: {}", url)
-
-        headers = {
-            "Authorization": f"Bearer {self._access_token}",
+            "X-Gateway-APIKey": self._api_gateway_token
         }
 
         if data:
@@ -151,13 +121,13 @@ class Smartmeter:
 
     def zaehlpunkte(self):
         """Returns zaehlpunkte for currently logged in user."""
-        return self._call_api_wstw("zaehlpunkte")
+        return self._call_api("zaehlpunkte")
 
     def welcome(self):
         """Returns response from 'welcome' endpoint."""
-        return self._call_api_wstw("zaehlpunkt/default/welcome")
+        return self._call_api("zaehlpunkt/default/welcome")
 
-    def verbrauch_raw(self, date_from, date_to=None, zaehlpunkt=None):
+    def verbrauch_raw(self, date_from: datetime, date_to: datetime = None, zaehlpunkt = None):
         """Returns energy usage.
 
         Args:
@@ -181,9 +151,9 @@ class Smartmeter:
             "dateTo": self._dt_string(date_to),
             "granularity": "DAY",
         }
-        return self._call_api_wstw(endpoint, query=query)
+        return self._call_api(endpoint, query=query)
 
-    def verbrauch(self, date_from, date_to=None, zaehlpunkt=None):
+    def verbrauch(self, date_from: datetime, date_to: datetime = None, zaehlpunkt = None):
         """Returns energy usage.
 
         Args:
@@ -195,32 +165,49 @@ class Smartmeter:
 
         Returns:
             dict: JSON response of api call to
-                'messdaten/zaehlpunkt/ZAEHLPUNKT/verbrauch'
+                'm/messdaten/zaehlpunkt/ZAEHLPUNKT/verbrauch'
         """
         if date_to is None:
             date_to = datetime.now()
         if zaehlpunkt is None:
             zaehlpunkt = self._get_first_zaehlpunkt()
         endpoint = "messdaten/zaehlpunkt/{}/verbrauch".format(zaehlpunkt)
-        query = {
-            "dateFrom": self._dt_string(date_from),
-            "dateTo": self._dt_string(date_to),
-            "period": "DAY",
-            "accumulate": False,
-            "offset": 0,
-            "dayViewResolution": "QUARTER-HOUR",
-        }
-        return self._call_api_wstw(endpoint, query=query)
+        query = const.build_verbrauchs_args(
+            dateFrom = self._dt_string(date_from),
+            dateTo = self._dt_string(date_to)
+        )
+        return self._call_api(endpoint, query=query)
+
+    def tages_verbrauch(self, day: datetime, zaehlpunkt = None):
+        """Returns energy usage.
+
+        Args:
+            day (datetime.datetime): Day date for the request
+            zaehlpunkt (str, optional): Id for desired smartmeter.
+                If None check for first meter in user profile.
+
+        Returns:
+            dict: JSON response of api call to
+                'messdaten/zaehlpunkt/ZAEHLPUNKT/verbrauch'
+        """
+
+        if zaehlpunkt is None:
+            zaehlpunkt = self._get_first_zaehlpunkt()
+        endpoint = "messdaten/zaehlpunkt/{}/verbrauch".format(zaehlpunkt)
+        query = const.build_verbrauchs_args(
+            dateFrom = self._dt_string(day.replace(hour=0, minute=0, second=0))
+        )
+        return self._call_api(endpoint, query=query)
 
     def profil(self):
         """Returns profil of logged in user.
 
         Returns:
-            dict: JSON response of api call to 'w/user/profile'
+            dict: JSON response of api call to 'user/profile'
         """
-        return self._call_api_wn("w/user/profile")
+        return self._call_api("user/profile", const.API_URL_ALT)
 
-    def ereignisse(self, date_from, date_to=None, zaehlpunkt=None):
+    def ereignisse(self, date_from: datetime, date_to: datetime = None, zaehlpunkt = None):
         """Returns events between date_from and date_to of a specific smart meter.
 
         Args:
@@ -231,7 +218,7 @@ class Smartmeter:
                 If is None check for first meter in user profile.
 
         Returns:
-            dict: JSON response of api call to 'w/user/ereignisse'
+            dict: JSON response of api call to 'user/ereignisse'
         """
         if date_to is None:
             date_to = datetime.now()
@@ -242,7 +229,7 @@ class Smartmeter:
             "dateFrom": self._dt_string(date_from),
             "dateUntil": self._dt_string(date_to),
         }
-        return self._call_api_wn("w/user/ereignisse", query=query)
+        return self._call_api("user/ereignisse", const.API_URL_ALT, query=query)
 
     def create_ereignis(self, zaehlpunkt, name, date_from, date_to=None):
         """Creates new event.
@@ -255,7 +242,7 @@ class Smartmeter:
             date_to (datetime.datetime, optional): Ending date for request.
 
         Returns:
-            dict: JSON response of api call to 'w/user/ereignis'
+            dict: JSON response of api call to 'user/ereignis'
         """
         if date_to is None:
             dto = None
@@ -272,8 +259,8 @@ class Smartmeter:
             "zaehlpunkt": zaehlpunkt,
         }
 
-        return self._call_api_wn("w/user/ereignis", data=data, method="POST")
+        return self._call_api("user/ereignis", data=data, method="POST")
 
     def delete_ereignis(self, ereignis_id):
         """Deletes ereignis."""
-        return self._call_api_wn("w/user/ereignis/{}".format(ereignis_id), method="DELETE")
+        return self._call_api("user/ereignis/{}".format(ereignis_id), method="DELETE")
